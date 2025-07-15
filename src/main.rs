@@ -12,6 +12,7 @@ struct JsonData {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
     let (_stream, stream_handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&stream_handle)?;
 

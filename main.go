@@ -3,24 +3,26 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
 )
-
-const bufferSize = 4096
 
 type DataChunk struct {
 	Data string `json:"data"`
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <file>\n", os.Args[0])
+	bufferSize := flag.Int("b", 8096, "buffer size")
+	flag.Parse()
+
+	if flag.NArg() < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [-b buffer_size] <file>\n", os.Args[0])
 		os.Exit(1)
 	}
 
-	filePath := os.Args[1]
+	filePath := flag.Arg(0)
 	file, err := os.Open(filePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening file: %v\n", err)
@@ -28,7 +30,7 @@ func main() {
 	}
 	defer file.Close()
 
-	buffer := make([]byte, bufferSize)
+	buffer := make([]byte, *bufferSize)
 	encoder := json.NewEncoder(os.Stdout)
 
 	for {
@@ -50,7 +52,6 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Println()
 		}
 	}
 }

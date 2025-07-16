@@ -17,12 +17,14 @@ type DataChunk struct {
 func main() {
 	var blockSize int
 	var fileType string
+	var mode string
 	flag.IntVar(&blockSize, "b", 8192, "block size for chunking")
 	flag.StringVar(&fileType, "type", "auto", "file type: mp3, wav, dumb, or auto")
+	flag.StringVar(&mode, "mode", "streaming", "chunking mode: streaming, complete (WAV only)")
 	flag.Parse()
 
 	if flag.NArg() < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-b blocksize] [-type mp3|wav|dumb|auto] <file>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-b blocksize] [-type mp3|wav|dumb|auto] [-mode streaming|complete] <file>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -43,10 +45,28 @@ func main() {
 	var chunker Chunker
 	switch strings.ToLower(fileType) {
 	case "mp3":
+		if mode != "streaming" {
+			fmt.Fprintf(os.Stderr, "Mode %s not supported for MP3 files, only streaming mode is available\n", mode)
+			os.Exit(1)
+		}
 		chunker = NewMP3Chunker(file, blockSize, 2048)
 	case "wav":
-		chunker = NewWAVChunker(file, blockSize)
+		var wavMode WAVChunkMode
+		switch strings.ToLower(mode) {
+		case "streaming":
+			wavMode = WAVModeStreaming
+		case "complete":
+			wavMode = WAVModeComplete
+		default:
+			fmt.Fprintf(os.Stderr, "Unsupported mode: %s. Use 'streaming' or 'complete'\n", mode)
+			os.Exit(1)
+		}
+		chunker = NewWAVChunker(file, blockSize, wavMode)
 	case "dumb":
+		if mode != "streaming" {
+			fmt.Fprintf(os.Stderr, "Mode %s not supported for dumb files, only streaming mode is available\n", mode)
+			os.Exit(1)
+		}
 		chunker = NewDumbChunker(file, blockSize)
 	default:
 		fmt.Fprintf(os.Stderr, "Unsupported file type: %s\n", fileType)

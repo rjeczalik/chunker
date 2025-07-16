@@ -1,9 +1,10 @@
 use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Arg, Command};
+use flate2::read::GzDecoder;
 use rodio::{Decoder, OutputStream, Sink};
 use serde::Deserialize;
-use std::io::{self, BufRead, Cursor};
+use std::io::{self, BufRead, Cursor, Read};
 use std::sync::mpsc;
 use std::thread;
 
@@ -32,13 +33,23 @@ fn main() -> Result<()> {
                 .help("Enable verbose output")
                 .action(clap::ArgAction::SetTrue)
         )
+        .arg(
+            Arg::new("gzip")
+                .long("gzip")
+                .help("Decompress gzip-compressed audio chunks")
+                .action(clap::ArgAction::SetTrue)
+        )
         .get_matches();
 
     let playback_format = matches.get_one::<String>("playback").unwrap();
     let verbose = matches.get_flag("verbose");
+    let decompress_gzip = matches.get_flag("gzip");
     
     if verbose {
         println!("Using playback format: {}", playback_format);
+        if decompress_gzip {
+            println!("Gzip decompression enabled");
+        }
     }
     
     let (_stream, stream_handle) = OutputStream::try_default()?;
@@ -119,8 +130,28 @@ fn main() -> Result<()> {
                 valid_json_count += 1;
                 match general_purpose::STANDARD.decode(&json_data.data) {
                     Ok(decoded_data) => {
+                        // Decompress if gzip flag is set
+                        let final_data = if decompress_gzip {
+                            let mut gz = GzDecoder::new(Cursor::new(&decoded_data));
+                            let mut decompressed = Vec::new();
+                            match gz.read_to_end(&mut decompressed) {
+                                Ok(_) => {
+                                    if verbose {
+                                        println!("Decompressed chunk from {} to {} bytes", decoded_data.len(), decompressed.len());
+                                    }
+                                    decompressed
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to decompress gzip data on line {}: {}", line_count, e);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            decoded_data
+                        };
+
                         successful_decode_count += 1;
-                        if tx.send(decoded_data).is_err() {
+                        if tx.send(final_data).is_err() {
                             break;
                         }
                     }

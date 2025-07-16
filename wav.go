@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"io"
 )
@@ -18,23 +20,25 @@ const (
 // WAVChunker yields WAV chunks suitable for HTTP streaming or complete playback.
 // WAV files are much simpler to chunk since they don't have frame dependencies.
 type WAVChunker struct {
-	r          io.Reader
-	targetSize int
-	mode       WAVChunkMode
-	err        error
-	header     []byte
-	headerSent bool
-	dataStart  int64
-	bytesRead  int64
-	dataSize   uint32
+	r           io.Reader
+	targetSize  int
+	mode        WAVChunkMode
+	compression int // gzip compression level (gzip.NoCompression for no compression)
+	err         error
+	header      []byte
+	headerSent  bool
+	dataStart   int64
+	bytesRead   int64
+	dataSize    uint32
 }
 
 // NewWAVChunker returns a new WAVChunker that reads from r.
-func NewWAVChunker(r io.Reader, chunkSize int, mode WAVChunkMode) *WAVChunker {
+func NewWAVChunker(r io.Reader, chunkSize int, mode WAVChunkMode, compression int) *WAVChunker {
 	return &WAVChunker{
-		r:          r,
-		targetSize: chunkSize,
-		mode:       mode,
+		r:           r,
+		targetSize:  chunkSize,
+		mode:        mode,
+		compression: compression,
 	}
 }
 
@@ -158,6 +162,30 @@ func (c *WAVChunker) createCompleteWAVFile(audioData []byte) []byte {
 	return result
 }
 
+// compressData compresses data using gzip if compression is enabled
+func (c *WAVChunker) compressData(data []byte) ([]byte, error) {
+	if c.compression == gzip.NoCompression {
+		return data, nil
+	}
+
+	var buf bytes.Buffer
+	writer, err := gzip.NewWriterLevel(&buf, c.compression)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := writer.Write(data); err != nil {
+		writer.Close()
+		return nil, err
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
 // Next returns the next chunk or io.EOF when done.
 func (c *WAVChunker) Next() ([]byte, error) {
 	if c.err != nil {
@@ -206,24 +234,34 @@ func (c *WAVChunker) Next() ([]byte, error) {
 	c.bytesRead += int64(n)
 	audioData = audioData[:n]
 
-	// Return appropriate chunk based on mode
+	var chunk []byte
+
+	// Create appropriate chunk based on mode
 	switch c.mode {
 	case WAVModeStreaming:
 		// Original streaming behavior
 		if c.bytesRead == c.dataStart+int64(n) {
 			// First chunk: include header + audio data
-			chunk := make([]byte, len(c.header)+len(audioData))
+			chunk = make([]byte, len(c.header)+len(audioData))
 			copy(chunk, c.header)
 			copy(chunk[len(c.header):], audioData)
-			return chunk, nil
 		} else {
 			// Subsequent chunks: just audio data
-			return audioData, nil
+			chunk = audioData
 		}
 	case WAVModeComplete:
 		// Complete mode: each chunk is a complete WAV file
-		return c.createCompleteWAVFile(audioData), nil
+		chunk = c.createCompleteWAVFile(audioData)
 	default:
 		return nil, errors.New("unknown WAV chunk mode")
 	}
+
+	// Apply compression if enabled
+	compressedChunk, err := c.compressData(chunk)
+	if err != nil {
+		c.err = err
+		return nil, err
+	}
+
+	return compressedChunk, nil
 }

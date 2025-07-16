@@ -13,22 +13,11 @@ func compareID(data []byte, id string) bool {
 	return data[0] == id[0] && data[1] == id[1] && data[2] == id[2] && data[3] == id[3]
 }
 
-// WAVChunkMode defines the chunking mode for WAV files
-type WAVChunkMode int
-
-const (
-	// WAVModeStreaming - first chunk has header + data, subsequent chunks are raw audio (for HTTP streaming)
-	WAVModeStreaming WAVChunkMode = iota
-	// WAVModeComplete - each chunk is a complete WAV file (for local playback)
-	WAVModeComplete
-)
-
-// WAVChunker yields WAV chunks suitable for HTTP streaming or complete playback.
+// WAVChunker yields WAV chunks as complete WAV files.
 // WAV files are much simpler to chunk since they don't have frame dependencies.
 type WAVChunker struct {
 	r          io.Reader
 	targetSize int
-	mode       WAVChunkMode
 	err        error
 	header     []byte
 	headerSent bool
@@ -44,11 +33,10 @@ type WAVChunker struct {
 }
 
 // NewWAVChunker returns a new WAVChunker that reads from r.
-func NewWAVChunker(r io.Reader, chunkSize int, mode WAVChunkMode) *WAVChunker {
+func NewWAVChunker(r io.Reader, chunkSize int) *WAVChunker {
 	return &WAVChunker{
 		r:             r,
 		targetSize:    chunkSize,
-		mode:          mode,
 		chunkBuffer:   make([]byte, 8),         // Reusable 8-byte buffer for chunk headers
 		audioBuffer:   make([]byte, chunkSize), // Reusable audio buffer
 		paddingBuffer: make([]byte, 1),         // Reusable padding buffer
@@ -203,13 +191,10 @@ func (c *WAVChunker) Next() ([]byte, error) {
 	}
 
 	// Read audio data for this chunk
-	readSize := c.targetSize
-	if c.mode == WAVModeComplete {
-		// For complete mode, subtract header size from target to leave room for header
-		readSize = c.targetSize - len(c.header)
-		if readSize <= 0 {
-			readSize = 1024 // minimum chunk size
-		}
+	// Subtract header size from target to leave room for header
+	readSize := c.targetSize - len(c.header)
+	if readSize <= 0 {
+		readSize = 1024 // minimum chunk size
 	}
 
 	if int64(readSize) > audioDataLeft {
@@ -234,28 +219,8 @@ func (c *WAVChunker) Next() ([]byte, error) {
 	c.bytesRead += int64(n)
 	audioData := c.audioBuffer[:n] // Slice the buffer to actual read size
 
-	var chunk []byte
-
-	// Create appropriate chunk based on mode
-	switch c.mode {
-	case WAVModeStreaming:
-		// Original streaming behavior
-		if c.bytesRead == c.dataStart+int64(n) {
-			// First chunk: include header + audio data
-			chunk = make([]byte, len(c.header)+len(audioData))
-			copy(chunk, c.header)
-			copy(chunk[len(c.header):], audioData)
-		} else {
-			// Subsequent chunks: just audio data - make a copy since we're reusing audioBuffer
-			chunk = make([]byte, len(audioData))
-			copy(chunk, audioData)
-		}
-	case WAVModeComplete:
-		// Complete mode: each chunk is a complete WAV file
-		chunk = c.createCompleteWAVFile(audioData)
-	default:
-		return nil, errors.New("unknown WAV chunk mode")
-	}
+	// Each chunk is a complete WAV file
+	chunk := c.createCompleteWAVFile(audioData)
 
 	return chunk, nil
 }

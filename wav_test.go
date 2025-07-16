@@ -47,7 +47,7 @@ func generateChunks(filename string, chunkSize int) ([][]byte, error) {
 	}
 	defer file.Close()
 
-	chunker := NewWAVChunker(file, chunkSize, WAVModeComplete)
+	chunker := NewWAVChunker(file, chunkSize)
 	var chunks [][]byte
 
 	for {
@@ -76,7 +76,7 @@ func BenchmarkWAVChunking(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		chunker := NewWAVChunker(file, 8192, WAVModeComplete)
+		chunker := NewWAVChunker(file, 8192)
 
 		// Process all chunks
 		for {
@@ -135,7 +135,7 @@ func BenchmarkWAVChunkingWithAllocations(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		chunker := NewWAVChunker(file, 8192, WAVModeComplete)
+		chunker := NewWAVChunker(file, 8192)
 
 		for {
 			_, err := chunker.Next()

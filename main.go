@@ -1,7 +1,6 @@
 package main
 
 import (
-	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -19,15 +18,15 @@ func main() {
 	var blockSize int
 	var fileType string
 	var mode string
-	var compressionLevel int
+
 	flag.IntVar(&blockSize, "b", 8192, "block size for chunking")
 	flag.StringVar(&fileType, "type", "auto", "file type: mp3, wav, dumb, or auto")
 	flag.StringVar(&mode, "mode", "streaming", "chunking mode: streaming, complete (WAV only)")
-	flag.IntVar(&compressionLevel, "gzip", gzip.NoCompression, "gzip compression level (0=no compression, 1=best speed, 9=best compression, -1=default)")
+
 	flag.Parse()
 
 	if flag.NArg() < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-b blocksize] [-type mp3|wav|dumb|auto] [-mode streaming|complete] [-gzip 0-9] <file>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-b blocksize] [-type mp3|wav|dumb|auto] [-mode streaming|complete] <file>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -52,10 +51,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Mode %s not supported for MP3 files, only streaming mode is available\n", mode)
 			os.Exit(1)
 		}
-		if compressionLevel != gzip.NoCompression {
-			fmt.Fprintf(os.Stderr, "Compression not supported for MP3 files\n")
-			os.Exit(1)
-		}
 		chunker = NewMP3Chunker(file, blockSize, 2048)
 	case "wav":
 		var wavMode WAVChunkMode
@@ -68,14 +63,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Unsupported mode: %s. Use 'streaming' or 'complete'\n", mode)
 			os.Exit(1)
 		}
-		chunker = NewWAVChunker(file, blockSize, wavMode, compressionLevel)
+		chunker = NewWAVChunker(file, blockSize, wavMode)
 	case "dumb":
 		if mode != "streaming" {
 			fmt.Fprintf(os.Stderr, "Mode %s not supported for dumb files, only streaming mode is available\n", mode)
-			os.Exit(1)
-		}
-		if compressionLevel != gzip.NoCompression {
-			fmt.Fprintf(os.Stderr, "Compression not supported for dumb files\n")
 			os.Exit(1)
 		}
 		chunker = NewDumbChunker(file, blockSize)

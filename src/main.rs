@@ -1,5 +1,6 @@
 use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
+use clap::{Arg, Command};
 use rodio::{Decoder, OutputStream, Sink};
 use serde::Deserialize;
 use std::io::{self, BufRead, Cursor};
@@ -13,15 +14,39 @@ struct JsonData {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+    
+    let matches = Command::new("jsonl_player")
+        .version("1.0")
+        .author("Your Name")
+        .about("Plays audio chunks from JSONL stream")
+        .arg(
+            Arg::new("playback")
+                .long("playback")
+                .value_name("FORMAT")
+                .help("Audio format for playback")
+                .value_parser(["mp3", "wav"])
+                .default_value("mp3")
+        )
+        .get_matches();
+
+    let playback_format = matches.get_one::<String>("playback").unwrap();
+    
     let (_stream, stream_handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&stream_handle)?;
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
+    let format = playback_format.clone();
     let consumer_thread = thread::spawn(move || {
         for decoded_data in rx {
             let audio_file = Cursor::new(decoded_data);
-            if let Ok(source) = Decoder::new_mp3(audio_file) {
+            let source = match format.as_str() {
+                "mp3" => Decoder::new_mp3(audio_file),
+                "wav" => Decoder::new_wav(audio_file),
+                _ => unreachable!("Invalid format should be caught by clap"),
+            };
+            
+            if let Ok(source) = source {
                 sink.append(source);
             }
         }

@@ -3,7 +3,34 @@ package main
 import (
 	"errors"
 	"io"
+	"runtime"
+	"sync"
 )
+
+const defaultChunkSize = 8192
+
+// Maximum size for non-data chunks to prevent OOM attacks
+const maxChunkSize = 1024 * 1024 // 1MB should be more than enough for WAV metadata
+const maxHeaderSize = 8 << 20    // 8 MB
+const minChunkSize = 1024        // 1KB
+
+// Pool for reusable byte buffers with 512 capacity
+// Beneficial for concurrent operations in service environments
+var headerBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 0, 512)
+	},
+}
+
+// Pool for reusable audio buffers with 8192 capacity
+// Allocated once per chunker instance, reused across all chunks
+var audioBufferPool = sync.Pool{
+	New: func() interface{} {
+		// the chunks can be enlarged by the WAVChunker.Next(),
+		// but they will eventually align with resemble chunk sizes
+		return make([]byte, defaultChunkSize)
+	},
+}
 
 // Helper function to compare 4 bytes to a string
 func compareID(data []byte, id string) bool {
@@ -16,32 +43,70 @@ func compareID(data []byte, id string) bool {
 // WAVChunker yields WAV chunks as complete WAV files.
 // WAV files are much simpler to chunk since they don't have frame dependencies.
 type WAVChunker struct {
-	r          io.Reader
-	targetSize int
-	err        error
-	header     []byte
-	headerSent bool
-	dataStart  int64
-	bytesRead  int64
-	dataSize   uint32
+	r              io.Reader
+	targetSize     int
+	err            error
+	headerSent     bool
+	dataStart      int64
+	bytesRead      int64
+	dataSize       uint32
+	dataSizeOffset int64
+	closed         bool
 	// Reusable buffers to reduce allocations
-	chunkBuffer []byte
-	audioBuffer []byte
-	// Additional buffers for common operations
-	paddingBuffer []byte
-	riffBuffer    []byte
+	riff    []byte
+	chunk   []byte
+	header  []byte
+	audio   []byte
+	padding [1]byte
 }
 
-// NewWAVChunker returns a new WAVChunker that reads from r.
-func NewWAVChunker(r io.Reader, chunkSize int) *WAVChunker {
-	return &WAVChunker{
-		r:             r,
-		targetSize:    chunkSize,
-		chunkBuffer:   make([]byte, 8),         // Reusable 8-byte buffer for chunk headers
-		audioBuffer:   make([]byte, chunkSize), // Reusable audio buffer
-		paddingBuffer: make([]byte, 1),         // Reusable padding buffer
-		riffBuffer:    make([]byte, 12),        // Reusable RIFF header buffer
+// NewWAVChunker returns a new WAVChunker that reads from r with fixed 8192 chunk size.
+func NewWAVChunker(r io.Reader) *WAVChunker {
+	c := &WAVChunker{
+		r:          r,
+		targetSize: defaultChunkSize,
+		riff:       make([]byte, 12),                // Reusable RIFF header buffer
+		chunk:      make([]byte, 8),                 // Reusable 8-byte buffer for chunk headers
+		header:     headerBufferPool.Get().([]byte), // Reusable header buffer
+		audio:      audioBufferPool.Get().([]byte),  // Get audio buffer from pool
 	}
+	// Set finalizer to ensure pool cleanup even if client abandons iteration
+	runtime.SetFinalizer(c, (*WAVChunker).Close)
+	return c
+}
+
+// reset returns the buffers back to their respective pools
+func (c *WAVChunker) reset() {
+	if c.closed {
+		return
+	}
+	c.closed = true
+
+	c.resetAudioBuffer()
+	c.resetHeaderBuffer()
+
+	// Clear finalizer since we're explicitly closing
+	runtime.SetFinalizer(c, nil)
+}
+
+func (c *WAVChunker) resetAudioBuffer() {
+	if c.audio != nil {
+		audioBufferPool.Put(c.audio)
+		c.audio = nil
+	}
+}
+
+func (c *WAVChunker) resetHeaderBuffer() {
+	if c.header != nil {
+		headerBufferPool.Put(c.header)
+		c.header = nil
+	}
+}
+
+// Close returns the buffers back to their respective pools and clears the finalizer.
+// Safe to call multiple times.
+func (c *WAVChunker) Close() {
+	c.reset()
 }
 
 // writeUint32LE writes a 32-bit little-endian unsigned integer
@@ -66,11 +131,11 @@ func readUint16LE(data []byte) uint16 {
 
 // parseWAVHeader parses the WAV header according to Resemble.AI specification
 func (c *WAVChunker) parseWAVHeader() error {
-	// Pre-allocate header buffer with reasonable estimate (typical WAV headers are ~100 bytes)
-	headerBuffer := make([]byte, 0, 512)
+	// Reset header buffer to ensure no leftover data from pool
+	c.header = c.header[:0]
 
 	// Read RIFF header (12 bytes) - reuse buffer
-	n, err := io.ReadFull(c.r, c.riffBuffer)
+	n, err := io.ReadFull(c.r, c.riff)
 	if err != nil {
 		return err
 	}
@@ -79,21 +144,24 @@ func (c *WAVChunker) parseWAVHeader() error {
 	}
 
 	// Check RIFF signature using byte comparison
-	if !compareID(c.riffBuffer[0:4], "RIFF") {
+	if !compareID(c.riff[0:4], "RIFF") {
 		return errors.New("not a valid WAV file: missing RIFF signature")
 	}
 
 	// Check WAVE signature using byte comparison
-	if !compareID(c.riffBuffer[8:12], "WAVE") {
+	if !compareID(c.riff[8:12], "WAVE") {
 		return errors.New("not a valid WAV file: missing WAVE signature")
 	}
 
-	headerBuffer = append(headerBuffer, c.riffBuffer...)
+	c.header = append(c.header, c.riff...)
 
 	// Read chunks until we find the data chunk
 	for {
+		if len(c.header) > maxHeaderSize {
+			return errors.New("wav header too large")
+		}
 		// Reuse the chunk buffer
-		n, err := io.ReadFull(c.r, c.chunkBuffer)
+		n, err := io.ReadFull(c.r, c.chunk)
 		if err != nil {
 			return err
 		}
@@ -102,22 +170,26 @@ func (c *WAVChunker) parseWAVHeader() error {
 		}
 
 		// Use byte comparison instead of string conversion
-		isDataChunk := compareID(c.chunkBuffer[0:4], "data")
-		chunkSize := readUint32LE(c.chunkBuffer[4:8])
+		isDataChunk := compareID(c.chunk[0:4], "data")
+		chunkSize := readUint32LE(c.chunk[4:8])
 
-		headerBuffer = append(headerBuffer, c.chunkBuffer...)
+		c.header = append(c.header, c.chunk...)
 
 		if isDataChunk {
 			// Found the data chunk
 			c.dataSize = chunkSize
-			c.header = headerBuffer
-			c.dataStart = int64(len(headerBuffer))
-			c.bytesRead = int64(len(headerBuffer))
+			c.dataStart = int64(len(c.header))
+			c.dataSizeOffset = int64(len(c.header) - 4)
+			c.bytesRead = int64(len(c.header))
 			return nil
 		}
 
 		// Read and include the chunk data in the header
-		// For large chunk data, we still need to allocate, but this is rare
+		// Guard against maliciously large chunk sizes that could cause OOM
+		if chunkSize > maxChunkSize {
+			return errors.New("chunk size too large")
+		}
+
 		chunkData := make([]byte, chunkSize)
 		n, err = io.ReadFull(c.r, chunkData)
 		if err != nil {
@@ -127,23 +199,28 @@ func (c *WAVChunker) parseWAVHeader() error {
 			return errors.New("incomplete chunk data")
 		}
 
-		headerBuffer = append(headerBuffer, chunkData...)
+		c.header = append(c.header, chunkData...)
 
 		// WAV chunks must be aligned on 2-byte boundaries
 		if chunkSize%2 == 1 {
-			n, err = io.ReadFull(c.r, c.paddingBuffer)
-			if err != nil && err != io.EOF {
+			n, err = io.ReadFull(c.r, c.padding[:])
+			if isErrNotEOF(err) {
 				return err
 			}
 			if n == 1 {
-				headerBuffer = append(headerBuffer, c.paddingBuffer...)
+				c.header = append(c.header, c.padding[:]...)
 			}
 		}
 	}
 }
 
 // createCompleteWAVFile creates a complete WAV file from header and audio data
+// Returns nil when audioData is empty
 func (c *WAVChunker) createCompleteWAVFile(audioData []byte) []byte {
+	if len(audioData) == 0 {
+		return nil
+	}
+
 	headerLen := len(c.header)
 	audioLen := len(audioData)
 	totalLen := headerLen + audioLen
@@ -156,7 +233,7 @@ func (c *WAVChunker) createCompleteWAVFile(audioData []byte) []byte {
 
 	// Update the data chunk size (last 4 bytes of header)
 	dataSize := writeUint32LE(uint32(audioLen))
-	copy(result[headerLen-4:headerLen], dataSize)
+	copy(result[c.dataSizeOffset:c.dataSizeOffset+4], dataSize)
 
 	// Update the overall file size in RIFF header (at offset 4)
 	totalSize := totalLen - 8 // -8 for RIFF header itself
@@ -178,6 +255,7 @@ func (c *WAVChunker) Next() ([]byte, error) {
 	// Parse header on first call
 	if !c.headerSent {
 		if err := c.parseWAVHeader(); err != nil {
+			c.reset()
 			c.err = err
 			return nil, err
 		}
@@ -187,6 +265,16 @@ func (c *WAVChunker) Next() ([]byte, error) {
 	// Check if we've read all the audio data
 	audioDataLeft := int64(c.dataSize) - (c.bytesRead - c.dataStart)
 	if audioDataLeft <= 0 {
+		// If data size is odd, consume the padding byte
+		if c.dataSize%2 == 1 {
+			_, err := io.ReadFull(c.r, c.padding[:])
+			if isErrNotEOF(err) {
+				c.reset()
+				c.err = err
+				return nil, err
+			}
+		}
+		c.reset()
 		return nil, io.EOF
 	}
 
@@ -194,33 +282,51 @@ func (c *WAVChunker) Next() ([]byte, error) {
 	// Subtract header size from target to leave room for header
 	readSize := c.targetSize - len(c.header)
 	if readSize <= 0 {
-		readSize = 1024 // minimum chunk size
+		readSize = minChunkSize
 	}
 
 	if int64(readSize) > audioDataLeft {
 		readSize = int(audioDataLeft)
 	}
 
-	// Resize audioBuffer if needed
-	if len(c.audioBuffer) < readSize {
-		c.audioBuffer = make([]byte, readSize)
+	// Resize audio buffer if needed
+	if len(c.audio) < readSize {
+		if cap(c.audio) >= readSize {
+			// We have enough capacity, just extend the slice
+			c.audio = c.audio[:readSize]
+		} else {
+			c.resetAudioBuffer()
+			// Allocate new buffer (can't use pool for sizes > defaultChunkSize)
+			c.audio = make([]byte, readSize)
+		}
 	}
 
-	// Read directly into the reusable buffer
-	n, err := c.r.Read(c.audioBuffer[:readSize])
-	if err != nil {
-		if err == io.EOF && n == 0 {
-			return nil, io.EOF
-		}
+	// Read directly into the reusable buffer using ReadFull to avoid partial reads
+	n, err := io.ReadFull(c.r, c.audio[:readSize])
+	if err != nil && !errors.Is(err, io.EOF) {
+		c.reset()
 		c.err = err
 		return nil, err
 	}
 
 	c.bytesRead += int64(n)
-	audioData := c.audioBuffer[:n] // Slice the buffer to actual read size
 
+	audioData := c.audio[:n] // Slice the buffer to actual read size
 	// Each chunk is a complete WAV file
 	chunk := c.createCompleteWAVFile(audioData)
 
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		// We stop processing when we hit EOF or unexpected EOF
+		// Both are treated as end of stream - return chunk with nil error
+		c.reset()
+		c.err = io.EOF
+		// Don't return the error - next call will return io.EOF naturally
+		return chunk, nil
+	}
+
 	return chunk, nil
+}
+
+func isErrNotEOF(err error) bool {
+	return err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF)
 }

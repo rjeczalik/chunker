@@ -47,7 +47,7 @@ func generateChunks(filename string, chunkSize int) ([][]byte, error) {
 	}
 	defer file.Close()
 
-	chunker := NewWAVChunker(file, chunkSize)
+	chunker := NewWAVChunker(file)
 	var chunks [][]byte
 
 	for {
@@ -76,7 +76,7 @@ func BenchmarkWAVChunking(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		chunker := NewWAVChunker(file, 8192)
+		chunker := NewWAVChunker(file)
 
 		// Process all chunks
 		for {
@@ -135,7 +135,7 @@ func BenchmarkWAVChunkingWithAllocations(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		chunker := NewWAVChunker(file, 8192)
+		chunker := NewWAVChunker(file)
 
 		for {
 			_, err := chunker.Next()
@@ -149,4 +149,63 @@ func BenchmarkWAVChunkingWithAllocations(b *testing.B) {
 
 		file.Close()
 	}
+}
+
+// BenchmarkWAVChunkingConcurrent simulates concurrent chunking operations
+// like in a service handling multiple requests
+func BenchmarkWAVChunkingConcurrent(b *testing.B) {
+	const numWorkers = 10
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			file, err := os.Open("sample.wav")
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer file.Close()
+
+			chunker := NewWAVChunker(file)
+
+			// Process all chunks
+			for {
+				_, err := chunker.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+}
+
+// BenchmarkWAVChunkingHighConcurrency simulates high concurrent load
+// like in a busy service with many simultaneous requests
+func BenchmarkWAVChunkingHighConcurrency(b *testing.B) {
+	b.ResetTimer()
+	b.SetParallelism(50) // Increase parallelism to simulate high load
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			file, err := os.Open("sample.wav")
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer file.Close()
+
+			chunker := NewWAVChunker(file)
+
+			// Process all chunks
+			for {
+				_, err := chunker.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
 }

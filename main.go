@@ -47,7 +47,7 @@ func main() {
 	case "mp3":
 		chunker = NewMP3Chunker(file, blockSize, 2048)
 	case "wav":
-		chunker = NewWAVChunker(file, blockSize)
+		chunker = NewWAVChunker(file)
 	case "dumb":
 		chunker = NewDumbChunker(file, blockSize)
 	default:

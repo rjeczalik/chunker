@@ -5,6 +5,14 @@ import (
 	"io"
 )
 
+// Helper function to compare 4 bytes to a string
+func compareID(data []byte, id string) bool {
+	if len(data) < 4 || len(id) != 4 {
+		return false
+	}
+	return data[0] == id[0] && data[1] == id[1] && data[2] == id[2] && data[3] == id[3]
+}
+
 // WAVChunkMode defines the chunking mode for WAV files
 type WAVChunkMode int
 
@@ -27,14 +35,24 @@ type WAVChunker struct {
 	dataStart  int64
 	bytesRead  int64
 	dataSize   uint32
+	// Reusable buffers to reduce allocations
+	chunkBuffer []byte
+	audioBuffer []byte
+	// Additional buffers for common operations
+	paddingBuffer []byte
+	riffBuffer    []byte
 }
 
 // NewWAVChunker returns a new WAVChunker that reads from r.
 func NewWAVChunker(r io.Reader, chunkSize int, mode WAVChunkMode) *WAVChunker {
 	return &WAVChunker{
-		r:          r,
-		targetSize: chunkSize,
-		mode:       mode,
+		r:             r,
+		targetSize:    chunkSize,
+		mode:          mode,
+		chunkBuffer:   make([]byte, 8),         // Reusable 8-byte buffer for chunk headers
+		audioBuffer:   make([]byte, chunkSize), // Reusable audio buffer
+		paddingBuffer: make([]byte, 1),         // Reusable padding buffer
+		riffBuffer:    make([]byte, 12),        // Reusable RIFF header buffer
 	}
 }
 
@@ -60,11 +78,11 @@ func readUint16LE(data []byte) uint16 {
 
 // parseWAVHeader parses the WAV header according to Resemble.AI specification
 func (c *WAVChunker) parseWAVHeader() error {
-	var headerBuffer []byte
+	// Pre-allocate header buffer with reasonable estimate (typical WAV headers are ~100 bytes)
+	headerBuffer := make([]byte, 0, 512)
 
-	// Read RIFF header (12 bytes)
-	riffHeader := make([]byte, 12)
-	n, err := io.ReadFull(c.r, riffHeader)
+	// Read RIFF header (12 bytes) - reuse buffer
+	n, err := io.ReadFull(c.r, c.riffBuffer)
 	if err != nil {
 		return err
 	}
@@ -72,22 +90,22 @@ func (c *WAVChunker) parseWAVHeader() error {
 		return errors.New("incomplete RIFF header")
 	}
 
-	// Check RIFF signature
-	if string(riffHeader[0:4]) != "RIFF" {
+	// Check RIFF signature using byte comparison
+	if !compareID(c.riffBuffer[0:4], "RIFF") {
 		return errors.New("not a valid WAV file: missing RIFF signature")
 	}
 
-	// Check WAVE signature
-	if string(riffHeader[8:12]) != "WAVE" {
+	// Check WAVE signature using byte comparison
+	if !compareID(c.riffBuffer[8:12], "WAVE") {
 		return errors.New("not a valid WAV file: missing WAVE signature")
 	}
 
-	headerBuffer = append(headerBuffer, riffHeader...)
+	headerBuffer = append(headerBuffer, c.riffBuffer...)
 
 	// Read chunks until we find the data chunk
 	for {
-		chunkHeader := make([]byte, 8)
-		n, err := io.ReadFull(c.r, chunkHeader)
+		// Reuse the chunk buffer
+		n, err := io.ReadFull(c.r, c.chunkBuffer)
 		if err != nil {
 			return err
 		}
@@ -95,12 +113,13 @@ func (c *WAVChunker) parseWAVHeader() error {
 			return errors.New("incomplete chunk header")
 		}
 
-		chunkID := string(chunkHeader[0:4])
-		chunkSize := readUint32LE(chunkHeader[4:8])
+		// Use byte comparison instead of string conversion
+		isDataChunk := compareID(c.chunkBuffer[0:4], "data")
+		chunkSize := readUint32LE(c.chunkBuffer[4:8])
 
-		headerBuffer = append(headerBuffer, chunkHeader...)
+		headerBuffer = append(headerBuffer, c.chunkBuffer...)
 
-		if chunkID == "data" {
+		if isDataChunk {
 			// Found the data chunk
 			c.dataSize = chunkSize
 			c.header = headerBuffer
@@ -110,6 +129,7 @@ func (c *WAVChunker) parseWAVHeader() error {
 		}
 
 		// Read and include the chunk data in the header
+		// For large chunk data, we still need to allocate, but this is rare
 		chunkData := make([]byte, chunkSize)
 		n, err = io.ReadFull(c.r, chunkData)
 		if err != nil {
@@ -123,13 +143,12 @@ func (c *WAVChunker) parseWAVHeader() error {
 
 		// WAV chunks must be aligned on 2-byte boundaries
 		if chunkSize%2 == 1 {
-			padding := make([]byte, 1)
-			n, err = io.ReadFull(c.r, padding)
+			n, err = io.ReadFull(c.r, c.paddingBuffer)
 			if err != nil && err != io.EOF {
 				return err
 			}
 			if n == 1 {
-				headerBuffer = append(headerBuffer, padding...)
+				headerBuffer = append(headerBuffer, c.paddingBuffer...)
 			}
 		}
 	}
@@ -137,23 +156,27 @@ func (c *WAVChunker) parseWAVHeader() error {
 
 // createCompleteWAVFile creates a complete WAV file from header and audio data
 func (c *WAVChunker) createCompleteWAVFile(audioData []byte) []byte {
-	// Create a copy of the header up to the data chunk size field
-	headerCopy := make([]byte, len(c.header))
-	copy(headerCopy, c.header)
+	headerLen := len(c.header)
+	audioLen := len(audioData)
+	totalLen := headerLen + audioLen
+
+	// Allocate result buffer once
+	result := make([]byte, totalLen)
+
+	// Copy header
+	copy(result, c.header)
 
 	// Update the data chunk size (last 4 bytes of header)
-	dataSize := writeUint32LE(uint32(len(audioData)))
-	copy(headerCopy[len(headerCopy)-4:], dataSize)
+	dataSize := writeUint32LE(uint32(audioLen))
+	copy(result[headerLen-4:headerLen], dataSize)
 
 	// Update the overall file size in RIFF header (at offset 4)
-	totalSize := len(headerCopy) + len(audioData) - 8 // -8 for RIFF header itself
+	totalSize := totalLen - 8 // -8 for RIFF header itself
 	riffSize := writeUint32LE(uint32(totalSize))
-	copy(headerCopy[4:8], riffSize)
+	copy(result[4:8], riffSize)
 
-	// Combine header and audio data
-	result := make([]byte, len(headerCopy)+len(audioData))
-	copy(result, headerCopy)
-	copy(result[len(headerCopy):], audioData)
+	// Copy audio data
+	copy(result[headerLen:], audioData)
 
 	return result
 }
@@ -193,8 +216,13 @@ func (c *WAVChunker) Next() ([]byte, error) {
 		readSize = int(audioDataLeft)
 	}
 
-	audioData := make([]byte, readSize)
-	n, err := c.r.Read(audioData)
+	// Resize audioBuffer if needed
+	if len(c.audioBuffer) < readSize {
+		c.audioBuffer = make([]byte, readSize)
+	}
+
+	// Read directly into the reusable buffer
+	n, err := c.r.Read(c.audioBuffer[:readSize])
 	if err != nil {
 		if err == io.EOF && n == 0 {
 			return nil, io.EOF
@@ -204,7 +232,7 @@ func (c *WAVChunker) Next() ([]byte, error) {
 	}
 
 	c.bytesRead += int64(n)
-	audioData = audioData[:n]
+	audioData := c.audioBuffer[:n] // Slice the buffer to actual read size
 
 	var chunk []byte
 
@@ -218,8 +246,9 @@ func (c *WAVChunker) Next() ([]byte, error) {
 			copy(chunk, c.header)
 			copy(chunk[len(c.header):], audioData)
 		} else {
-			// Subsequent chunks: just audio data
-			chunk = audioData
+			// Subsequent chunks: just audio data - make a copy since we're reusing audioBuffer
+			chunk = make([]byte, len(audioData))
+			copy(chunk, audioData)
 		}
 	case WAVModeComplete:
 		// Complete mode: each chunk is a complete WAV file
